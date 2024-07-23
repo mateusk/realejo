@@ -5,19 +5,45 @@ Modules :
 3. TTS.api - to generate audio from text using TTS
 """
 import json
+import random
 import requests
 from TTS.api import TTS
+import serial
 
 # Get DEVICE
 DEVICE = "cpu"
 
+# Set pre-defined topics to generate poems
+TOPICS = [
+    "a rainy day at a sex shop in Berlin",
+    "a toaster that does not work",
+    "a one eyed cat looking through an eyewear shop window",
+    "stomach ache after an incredible meal",
+    "the line at the Döner Kebab shop",
+    "a washed-up and unreadable note in the pocket of some jeans",
+    "a second hand pullover in summer, standing in the sun",
+    "someone's first day at a sauna",
+    "a yellowed-leaf monstera plant in a butcher shop",
+    "a silly origami bird left in a S-Bahn",
+    "a weird TikTok trend",
+]
+
+PROMPT_PREFIX = "Write a short, joyful 5 line poem about "
+PROMPT_SUFFIX = ". Do not give me any comments from your side. Just write the poem."
+
+ARDUINO = serial.Serial('/dev/tty.usbmodem2101', 9600)
+
+tts_output_file_counter = 0
+
+can_generate = True
+
 # Init TTS
 TTS = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(DEVICE)
 
-# Function to get user input
-def get_user_input():
-    """Function to get user input"""
-    return input("Enter your prompt for LLAMA3: ")
+# Select random topic from the pre-defined list
+def get_topic():
+    """Function to select a random prompt from the pre-defined list"""
+    return random.choice(TOPICS)
 
 # Function to make a POST request to LLAMA3 API
 def get_llama3_response(prompt):
@@ -55,18 +81,49 @@ def generate_speech(text):
 
     print("Audio saved as output.wav")
 
-def main():
-    """Main function"""
-    user_input = get_user_input()
-    response = get_llama3_response(user_input)
+def read_serial():
+    """Function to read serial data from Arduino"""
+    if ARDUINO.in_waiting > 0:
+        line = ARDUINO.readline().decode('utf-8').rstrip()
+        print("Line from Arduino:", line)
+        if line == "1":
+            return True
+
+    else:
+        return False
+
+def run_main_flow():
+    """Main flow of the program"""
+    topic = get_topic()
+    prompt = PROMPT_PREFIX + topic + PROMPT_SUFFIX
+    print("Prompt to LLAMA3:")
+    print(prompt)
+
+    response = get_llama3_response(prompt)
 
     if response.status_code == 200:
         full_response = parse_streamed_response(response)
         print("Response from LLAMA3:")
         print(full_response)
         generate_speech(full_response)
+
     else:
         print("Failed to get a response from LLAMA3. Status code:", response.status_code)
+
+
+def main():
+    """Main function"""
+    global can_generate
+
+    # Wait for the user to press Enter, then start the main flow
+    while True:
+        button_pressed = read_serial()
+        print("Button pressed:", button_pressed)
+        if button_pressed and can_generate:
+
+            can_generate = False
+            run_main_flow()
+            can_generate = True
 
 if __name__ == "__main__":
     main()

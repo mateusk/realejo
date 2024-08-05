@@ -31,7 +31,7 @@ TOPICS = [
 PROMPT_PREFIX = "Write a short, joyful 5 line poem about "
 PROMPT_SUFFIX = ". Do not give me any comments from your side. Just write the poem."
 
-ARDUINO = serial.Serial('/dev/tty.usbmodem2101', 9600)
+ARDUINO = serial.Serial('/dev/tty.usbmodem141101', 9600)
 
 tts_output_file_counter = 0
 
@@ -59,8 +59,8 @@ def get_llama3_response(prompt):
     }
 
     response = requests.post(api_endpoint, headers=headers, json=payload, stream=True, timeout=10)
-
     return response
+   
 
 def parse_streamed_response(response):
     """Function to parse the streamed response from LLAMA3 API"""
@@ -114,10 +114,10 @@ def run_main_flow():
 def main():
     """Main function"""
     global can_generate
-
-    # Wait for the user to press Enter, then start the main flow
-    while True:
-        button_pressed = read_serial()
+    
+    while True: # monitor button
+        if can_generate:
+            button_pressed = read_serial()
         print("Button pressed:", button_pressed)
         if button_pressed and can_generate:
 

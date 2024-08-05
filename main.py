@@ -1,17 +1,37 @@
 """
-Modules :
-1. json - to parse the streamed response from LLAMA3 API
-2. requests - to make a POST request to LLAMA3 API
-3. TTS.api - to generate audio from text using TTS
+Modules:
+- TTS: Text-to-Speech
+- pydub: Audio manipulation
+- bleak: Bluetooth Low Energy
+- PIL: Image manipulation
+- requests: HTTP requests
+- threading: Multithreading
+- shutil: File operations
+- asyncio: Asynchronous I/O
+- queue: Thread-safe queue
+- serial: Serial communication
 """
-import json
-import random
-import requests
-from TTS.api import TTS
-import serial
 
-# Get DEVICE
-DEVICE = "cpu"
+import json
+import os
+import sys
+import time
+import random
+from enum import Enum
+import threading
+import shutil
+import asyncio
+import queue
+import requests
+import serial
+from TTS.api import TTS
+from pydub import AudioSegment
+from pydub.playback import _play_with_simpleaudio as play_with_simpleaudio
+from bleak import BleakScanner, BleakClient
+from PIL import Image, ImageFont, ImageDraw, ImageColor
+
+# Set the device to use for TTS
+TTS_DEVICE = "cpu"
 
 # Set pre-defined topics to generate poems
 TOPICS = [
@@ -31,99 +51,484 @@ TOPICS = [
 PROMPT_PREFIX = "Write a short, joyful 5 line poem about "
 PROMPT_SUFFIX = ". Do not give me any comments from your side. Just write the poem."
 
-ARDUINO = serial.Serial('/dev/tty.usbmodem2101', 9600)
+class State(Enum):
+    """Enum class to represent the state of the program"""
+    IDLE = 1
+    INTERACTION = 2
 
-tts_output_file_counter = 0
+state = State.IDLE
 
-can_generate = True
+DEBUG = True
+
+FONT = "fonts/CrimsonPro-Regular.ttf"
+
+# ARDUINO = serial.Serial('/dev/tty.usbmodem2101', 9600)
+
+# Track generated poem files
+generated_poems_count = len([f for f in os.listdir("tts/generated-poems") if f.endswith(".wav")])
+
+stop_idle_event = threading.Event()
+stop_button_event = threading.Event()
+button_thread = None
+idle_thread = None
+audio_queue = queue.Queue()
+audio_playback_thread = None
+audio_playback_lock = threading.Lock()
+current_audio_playback = None
 
 # Init TTS
-TTS = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(DEVICE)
+TTS = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(TTS_DEVICE)
 
-# Select random topic from the pre-defined list
+PRINTER_DATA_FORMATTER = "m02_printer_data_formatter.py"
+
+# Helper function to handle errors
+def must(action, err):
+    if err:
+        sys.exit(f"Fatal error: Failed to {action}: {err}")
+
+# Copy the file to the target folder
+def copy_file_to_folder(file, folder):
+    try:
+        if not os.path.exists(folder):
+            os.makedirs(folder)
+        shutil.copy(file, os.path.join(folder, "toprint.jpg"))
+    except Exception as e:
+        must(f"copy {file} to {folder}", e)
+
+async def find_printer():
+    print("Scanning for Bluetooth devices...")
+    devices = await BleakScanner.discover()
+
+    target_device = None
+    for device in devices:
+        if device.name == "Mr.in_M02":
+            target_device = device
+            break
+
+    if not target_device:
+        return None
+
+    print("Found the printer:", target_device)
+    return target_device
+
+# Function to handle printing process
+async def print_file(device, data_formatter_script_loc, file_path):
+    """Try to print the file"""
+    try:
+        async with BleakClient(device) as client:
+            print("Connected to", device)
+
+            # Discover services
+            services = client.services
+
+            print("Services:", services)
+
+            char0 = None
+            char1 = None
+
+            for service in services:
+                for char in service.characteristics:
+                    print(f"Characteristic {char.uuid}: {char}")
+                    # char0 should start with 0000ff01
+                    if char.uuid.startswith("0000ff01"):
+                        char0 = char.uuid
+                    # char1 should start with 0000ff02
+                    if char.uuid.startswith("0000ff02"):
+                        char1 = char.uuid
+
+            print("Characteristics:", char0, char1)
+
+            # Write the data
+            path_pho = file_path + ".pho"
+
+            command = f"python3 {data_formatter_script_loc} {file_path} > {path_pho}"
+            print("Running command:", command)
+            os.system(command)
+            print("Data written to printer")
+
+            # Write data to characteristic
+
+            with open(path_pho, "rb") as f:
+                data = f.read()
+
+                print("Data bytes:", len(data))
+                print("Data:", data)
+
+                # Write the data
+                await client.write_gatt_char(char1, data, response=True)
+
+                # Check if the data was written
+                await client.read_gatt_char(char0)
+
+            # Remove the file
+            os.remove(path_pho)
+
+    except Exception as e:
+        print(f"Failed to connect or print: {e}")
+
 def get_topic():
-    """Function to select a random prompt from the pre-defined list"""
+    """Select a random prompt from the pre-defined list"""
     return random.choice(TOPICS)
 
-# Function to make a POST request to LLAMA3 API
 def get_llama3_response(prompt):
-    """Function to make a POST request to LLAMA3 API"""
+    """Make a POST request to LLAMA3 API"""
     api_endpoint = "http://localhost:11434/api/generate"
     headers = {"Content-Type": "application/json"}
     payload = {
-      "model": "llama3",
-      "prompt": prompt,
-      "options": {
-        "num_ctx": 4096
-      }
+        "model": "llama3",
+        "prompt": prompt,
+        "options": {"num_ctx": 4096}
     }
 
-    response = requests.post(api_endpoint, headers=headers, json=payload, stream=True, timeout=10)
+    try:
+        if DEBUG:
+            print("Sending request to LLAMA3 API...")
+        response = requests.post(api_endpoint,
+                                 headers=headers,
+                                 json=payload,
+                                 stream=True,
+                                 timeout=10)
 
-    return response
+        if DEBUG:
+            print("Response from LLAMA3 API:", response.status_code)
+        return response
+    except Exception as e:
+        print(f"Error in get_llama3_response: {e}")
+        return None
 
 def parse_streamed_response(response):
-    """Function to parse the streamed response from LLAMA3 API"""
+    """Parse the streamed response from LLAMA3 API"""
     full_response = ""
-
     for line in response.iter_lines():
         if line:
             decoded_line = line.decode('utf-8')
             json_obj = json.loads(decoded_line)
             if "response" in json_obj:
                 full_response += json_obj["response"]
-
     return full_response
 
-def generate_speech(text):
-    """Function to generate audio from text using TTS"""
-    TTS.tts_to_file(text, speaker_wav="InGhetto.wav", language="en", file_path="output.wav")
+def generate_tts(text):
+    """Generate audio from text using TTS"""
+    global generated_poems_count
+    generated_poems_count += 1
+    file_path = f"tts/generated-poems/poem-{generated_poems_count}.wav"
+    try:
+        TTS.tts_to_file(text, speaker_wav="tts/voice-cloning/ref.wav", language="en", file_path=file_path)
+        if DEBUG:
+            print(f"Audio saved as {file_path}")
+    except Exception as e:
+        print(f"Error generating speech: {e}")
 
-    print("Audio saved as output.wav")
+def generate_image_from_text(
+    text: str,
+    font_path: str):
+    """Generate an image from text"""
 
-def read_serial():
-    """Function to read serial data from Arduino"""
-    if ARDUINO.in_waiting > 0:
-        line = ARDUINO.readline().decode('utf-8').rstrip()
-        print("Line from Arduino:", line)
-        if line == "1":
-            return True
+    # Set the image size
+    image_size = (256, 256)
+    padding = 10
 
-    else:
-        return False
+    # Calculate the appropriate font size
+    # font_size = calculate_font_size(text, image_size, font_path, padding)
+    font_size = 20
 
-def run_main_flow():
+    # Set the font
+    font = ImageFont.truetype(font_path, font_size)
+
+    # Create the image
+    image = Image.new("RGB", image_size, "white")
+    draw = ImageDraw.Draw(image)
+
+    # Wrap the text
+    wrapped_text = wrap_text(text, font, image_size[0] - 2 * padding)
+
+    # Calculate text position
+    text_position = (padding, padding)
+
+    # Draw the text on the image
+    draw.multiline_text(text_position, wrapped_text, font=font, fill=ImageColor.getrgb("black"))
+
+    # Save the image
+    image.save(f"generated-poems/img/poem-{generated_poems_count}.png")
+
+    print(f"Text image saved with font size: {font_size}")
+
+# Function to wrap text to fit within the specified width,
+# while still keeping original line breaks
+def wrap_text(text, font, max_width):
+    """Wrap text to fit within the specified width, while still keeping original line breaks"""
+    lines = text.split("\n")
+    wrapped_lines = []
+    for line in lines:
+        words = line.split()
+        wrapped_line = ""
+        for word in words:
+            wrapped_line_test = wrapped_line + word + " "
+            wrapped_line_test_bbox = font.getbbox(wrapped_line_test)
+            if wrapped_line_test_bbox[2] <= max_width:
+                wrapped_line = wrapped_line_test
+            else:
+                wrapped_lines.append(wrapped_line)
+                wrapped_line = word + " "
+        wrapped_lines.append(wrapped_line)
+    return "\n".join(wrapped_lines)
+
+# Function to calculate the maximum font size that fits within the image height
+def calculate_font_size(text,
+                        image_size,
+                        font_path,
+                        padding,
+                        max_font_size=30):
+    """Calculate the maximum font size that fits within the image height"""
+    max_width, max_height = image_size
+    font_size = 1
+    while font_size < max_font_size:
+        font = ImageFont.truetype(font_path, font_size)
+        text_bbox = ImageDraw.Draw(Image.new('RGB', image_size)).textbbox((0, 0), text, font=font)
+        text_height = text_bbox[3] - text_bbox[1]
+
+        if text_height >= max_height - 2 * padding:
+            break
+
+        font_size += 1
+
+    return font_size - 1
+
+def play_audio(audio_file):
+    """Play audio file"""
+    global current_audio_playback
+    try:
+        if current_audio_playback:
+            with audio_playback_lock:
+                current_audio_playback.stop()
+        audio = AudioSegment.from_file(audio_file)
+        playback = play_with_simpleaudio(audio)
+        with audio_playback_lock:
+            current_audio_playback = playback
+        playback.wait_done()
+    except Exception as e:
+        print(f"Error playing audio file {audio_file}: {e}")
+    finally:
+        with audio_playback_lock:
+            if current_audio_playback == playback:
+                current_audio_playback = None
+
+def play_audio_from_queue():
+    """Play audio files from a queue"""
+    while True:
+        audio_file = audio_queue.get()
+        if audio_file is None:  # Sentinel value to exit the thread
+            break
+        play_audio(audio_file)
+        audio_queue.task_done()
+
+def start_audio_playback_thread():
+    """Start the audio playback thread"""
+    global audio_playback_thread
+
+    if DEBUG:
+        print("Starting the audio playback thread...")
+
+    audio_playback_thread = threading.Thread(target=play_audio_from_queue)
+    audio_playback_thread.daemon = True
+    audio_playback_thread.start()
+
+def stop_audio_playback_thread():
+    """Stop the audio playback thread"""
+    global audio_playback_thread, current_audio_playback, audio_playback_lock
+
+    if DEBUG:
+        print("Stopping the audio playback thread...")
+
+    audio_queue.put(None)
+    audio_playback_thread.join()
+
+    if current_audio_playback:
+        with audio_playback_lock:
+            current_audio_playback.stop()
+
+def monitor_button_press():
+    """Simulate reading serial data from Arduino"""
+    global state, stop_button_event
+    while not stop_button_event.is_set():
+        try:
+            # if ARDUINO.in_waiting > 0:
+            #     line = ARDUINO.readline().decode('utf-8').rstrip()
+            #     print("Line from Arduino:", line)
+            #     if line == "1":
+            #         return True
+
+            button_state = input("Press the button (0 or 1): ")
+            if button_state == "1" and state == State.IDLE:
+                if DEBUG:
+                    print("Button pressed!")
+                state = State.INTERACTION
+
+                # Set the stop event to stop the idle flow
+                if DEBUG:
+                    print("Send the idle stop event...")
+                stop_idle_event.set()  # Stop idle flow
+                if DEBUG:
+                    print("Send the button stop event...")
+                stop_button_event.set()  # Stop button monitoring
+        except Exception as e:
+            print(f"Error in monitor_button_press: {e}")
+
+        time.sleep(0.1)
+
+def start_button_monitoring():
+    """Start the button monitoring thread"""
+    global button_thread, stop_button_event
+
+    stop_button_event.clear()
+
+    if DEBUG:
+        print("Starting the button monitoring thread...")
+    button_thread = threading.Thread(target=monitor_button_press)
+    button_thread.daemon = True
+    button_thread.start()
+
+def stop_button_monitoring():
+    """Stop the button monitoring thread"""
+    global stop_button_event
+
+    if DEBUG:
+        print("Stopping the button monitoring thread...")
+    stop_button_event.set()
+    button_thread.join()
+
+def run_idle_flow():
+    """Run the idle flow"""
+    try:
+        if DEBUG:
+            print("Running idle flow...")
+        # Create a list of .wav files from the audio folder
+        audio_files = [f for f in os.listdir("audio/realejo") if f.endswith(".wav")]
+        # Select a random audio file from the list
+        audio_file = "audio/realejo/" + random.choice(audio_files)
+        # audio_queue.put(audio_file)
+        time.sleep(0.1)
+
+        # Change the list of audio files to the pre-recorded TTS files
+        audio_files = [f for f in os.listdir("tts/pre-recorded") if f.endswith(".wav")]
+        audio_file = "tts/pre-recorded/" + random.choice(audio_files)
+        # audio_queue.put(audio_file)
+        time.sleep(3)
+
+        if DEBUG:
+            print("End of idle flow.")
+    except Exception as e:
+        if DEBUG:
+            print(f"Error in run_idle_flow: {e}")
+
+def start_idle_flow():
+    """Start the idle flow"""
+    global idle_thread
+
+    stop_idle_event.clear()
+
+    if DEBUG:
+        print("Starting idle flow...")
+    idle_thread = threading.Thread(target=run_idle_flow)
+    idle_thread.daemon = True
+    idle_thread.start()
+
+def stop_idle_flow():
+    """Stop the idle flow"""
+    global stop_idle_event, idle_thread
+    if DEBUG:
+        print("Stopping the idle flow...")
+    stop_idle_event.set()
+    idle_thread.join()
+
+async def run_interaction_flow():
     """Main flow of the program"""
+    global state
+    if DEBUG:
+        print("Running the interaction flow...")
     topic = get_topic()
     prompt = PROMPT_PREFIX + topic + PROMPT_SUFFIX
-    print("Prompt to LLAMA3:")
-    print(prompt)
+    if DEBUG:
+        print("Prompt to LLAMA3:", prompt)
 
     response = get_llama3_response(prompt)
 
-    if response.status_code == 200:
-        full_response = parse_streamed_response(response)
-        print("Response from LLAMA3:")
-        print(full_response)
-        generate_speech(full_response)
+    if response and response.status_code == 200:
+        poem = parse_streamed_response(response)
+        # if DEBUG:
+        #     print("Generating speech from response...")
+        # generate_tts(poem)
+
+        # Generate a .txt file with the poem
+        with open(f"generated-poems/txt/poem-{generated_poems_count}.txt", "w") as file:
+            file.write(poem)
+
+        # Generate a 256x256 image with the text of the poem
+        generate_image_from_text(poem, FONT)
+
+        # Print the poem
+        print("Printing the poem...")
+        printer = await find_printer()
+
+        if printer:
+            await print_file(
+              printer, PRINTER_DATA_FORMATTER,
+              f"generated-poems/img/poem-{generated_poems_count}.png")
+
+        else:
+            print("Printer not found.")
 
     else:
-        print("Failed to get a response from LLAMA3. Status code:", response.status_code)
+        if DEBUG:
+            print("Failed to get a response from LLAMA3 or invalid response.",
+                  "Status code:", response.status_code if response else "N/A")
 
+    if DEBUG:
+        print("End of interaction flow.")
 
 def main():
     """Main function"""
-    global can_generate
+    global button_thread, audio_playback_thread, current_audio_playback, state, stop_idle_event, stop_button_event, audio_playback_lock
 
-    # Wait for the user to press Enter, then start the main flow
+    # Start the button press checking thread
+    start_button_monitoring()
+
+    # Start the audio playback thread
+    start_audio_playback_thread()
+
     while True:
-        button_pressed = read_serial()
-        print("Button pressed:", button_pressed)
-        if button_pressed and can_generate:
+        try:
+            if state == State.IDLE:
+                # If the button monitoring thread is not running, start it
+                if button_thread is None or not button_thread.is_alive():
+                    start_button_monitoring()
 
-            can_generate = False
-            run_main_flow()
-            can_generate = True
+                # If the idle flow thread is not running, start it
+                if idle_thread is None or not idle_thread.is_alive():
+                    start_idle_flow()
+
+            elif state == State.INTERACTION:
+                if button_thread is not None and button_thread.is_alive():
+                    stop_button_monitoring()
+
+                if idle_thread is not None and idle_thread.is_alive():
+                    stop_idle_flow()
+
+                if audio_playback_thread is not None and audio_playback_thread.is_alive():
+                    stop_audio_playback_thread()
+
+                asyncio.run(run_interaction_flow())
+
+                if DEBUG:
+                    print("Resuming idle state...")
+                state = State.IDLE
+
+            time.sleep(0.1)
+        except Exception as e:
+            print(f"Error in main loop: {e}")
+
+    audio_queue.put(None)
+    audio_playback_thread.join()
 
 if __name__ == "__main__":
     main()

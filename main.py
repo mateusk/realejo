@@ -18,6 +18,7 @@ import time
 import random
 from enum import Enum
 import threading
+import concurrent.futures
 import asyncio
 import queue
 import requests
@@ -78,6 +79,7 @@ audio_queue = queue.Queue()
 audio_playback_thread = None
 audio_playback_lock = threading.Lock()
 current_audio_playback = None
+tts_generation_thread = None
 
 # Init TTS
 TTS = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(TTS_DEVICE)
@@ -133,6 +135,7 @@ def parse_streamed_response(response):
 
 def generate_tts(text):
     """Generate audio from text using TTS"""
+    print("generate_tts")
     global generated_poems_count
     generated_poems_count += 1
     file_path = f"tts/generated-poems/poem-{generated_poems_count}.wav"
@@ -142,6 +145,12 @@ def generate_tts(text):
             print(f"Audio saved as {file_path}")
     except Exception as e:
         print(f"Error generating speech: {e}")
+        
+def generate_tts_thread(text):
+    """Generate audio from text using TTS in a separate thread"""
+    global tts_generation_thread
+    tts_generation_thread = threading.Thread(target=generate_tts, args=(text,))
+    tts_generation_thread.start()
 
 # ----------------------- Printing-related functions ---------------------------
 
@@ -462,35 +471,41 @@ async def run_interaction_flow():
         if not SKIP_TTS_PRINTING:
             if DEBUG:
                 print("Generating speech from response...")
-            generate_tts(poem)
+            # Create a thread pool executor
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                # Submit the generate_tts_async function to the executor
+                future = executor.submit(generate_tts, poem)
 
-            # Generate a .txt file with the poem
-            if DEBUG:
-                print("Saving the poem as a .txt file...")
-            with open(f"generated-poems/txt/poem-{generated_poems_count}.txt",
-                    "w", encoding="utf-8") as file:
-                file.write(poem)
+                # Generate a .txt file with the poem
+                if DEBUG:
+                    print("Saving the poem as a .txt file...")
+                with open(f"generated-poems/txt/poem-{generated_poems_count}.txt",
+                        "w", encoding="utf-8") as file:
+                    file.write(poem)
 
-            # Generate a 256x256 image with the text of the poem
-            if DEBUG:
-                print("Generating an image from the poem...")
-            generate_image_from_text(poem, FONT)
+                # Generate a 256x256 image with the text of the poem
+                if DEBUG:
+                    print("Generating an image from the poem...")
+                generate_image_from_text(poem, FONT)
 
-            # Print the poem
-            if DEBUG:
-                print("Printing the poem...")
-            printer = await find_printer()
-
-            # The printer is sometimes not found, so we need to loop
-            # until it is found
-            while not printer:
-                print("Error: printer not found. Trying again...")
+                # Print the poem
+                if DEBUG:
+                    print("Printing the poem...")
                 printer = await find_printer()
 
-            if printer:
-                await print_file(
-                  printer, PRINTER_DATA_FORMATTER,
-                  f"generated-poems/img/poem-{generated_poems_count}.png")
+                # The printer is sometimes not found, so we need to loop
+                # until it is found
+                while not printer:
+                    print("Error: printer not found. Trying again...")
+                    printer = await find_printer()
+
+                if printer:
+                    await print_file(
+                    printer, PRINTER_DATA_FORMATTER,
+                    f"generated-poems/img/poem-{generated_poems_count}.png")
+                
+                # Wait for the TTS generation to complete
+                future.result()
 
     else:
         print("Failed to get a response from LLAMA3 or invalid response.",

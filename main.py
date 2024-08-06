@@ -65,6 +65,8 @@ TOPICS = [
     "a love letter to myself",
     "all my scars",
     "my flaws and mistakes",
+    "a fortune card for contemporary misfits",
+    "barefoot and glass",
 ]
 
 PROMPT_PREFIX = "Write a short, joyful 5 line poem about "

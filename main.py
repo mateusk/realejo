@@ -1,15 +1,14 @@
 """
 Modules:
 - TTS: Text-to-Speech
-- pydub: Audio manipulation
 - bleak: Bluetooth Low Energy
-- PIL: Image manipulation
 - requests: HTTP requests
 - threading: Multithreading
-- shutil: File operations
 - asyncio: Asynchronous I/O
 - queue: Thread-safe queue
 - serial: Serial communication
+- pygame: Audio playback
+- PIL: Image manipulation
 """
 
 import json
@@ -19,7 +18,6 @@ import time
 import random
 from enum import Enum
 import threading
-import shutil
 import asyncio
 import queue
 import requests
@@ -61,14 +59,18 @@ DEBUG = True
 
 FONT = "fonts/CrimsonPro-Regular.ttf"
 
-# ARDUINO = serial.Serial('/dev/tty.usbmodem2101', 9600)
+# Set up the Arduinoserial connection variables
+arduino: serial.Serial = None # type: ignore
+ARDUINO_PORT = "/dev/tty.usbmodem14401"
 
 # Track generated poem files
-generated_poems_count = len([f for f in os.listdir("tts/generated-poems") if f.endswith(".wav")])
+generated_poems_count = len(
+    [f for f in os.listdir("tts/generated-poems") if f.endswith(".wav")])
 
 stop_idle_event = threading.Event()
 stop_button_event = threading.Event()
 stop_audio_event = threading.Event()
+state_lock = threading.Lock()
 
 button_thread = None
 idle_thread = None
@@ -81,6 +83,8 @@ current_audio_playback = None
 TTS = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(TTS_DEVICE)
 
 PRINTER_DATA_FORMATTER = "m02_printer_data_formatter.py"
+
+SKIP_TTS_PRINTING = False
 
 # ------------- Poem generation and LLAMA3 API-related functions ---------------
 
@@ -105,7 +109,7 @@ def get_llama3_response(prompt):
                                  headers=headers,
                                  json=payload,
                                  stream=True,
-                                 timeout=10)
+                                 timeout=100)
 
         if DEBUG:
             print("Response from LLAMA3 API:", response.status_code)
@@ -133,7 +137,7 @@ def generate_tts(text):
     generated_poems_count += 1
     file_path = f"tts/generated-poems/poem-{generated_poems_count}.wav"
     try:
-        TTS.tts_to_file(text, speaker_wav="tts/voice-cloning/ref.wav", language="en", file_path=file_path)
+        TTS.tts_to_file(text, speaker_wav="tts/voice-cloning/ref.wav", language="en", file_path=file_path) # type: ignore
         if DEBUG:
             print(f"Audio saved as {file_path}")
     except Exception as e:
@@ -212,7 +216,8 @@ async def print_file(device, data_formatter_script_loc, file_path):
 
             for service in services:
                 for char in service.characteristics:
-                    print(f"Characteristic {char.uuid}: {char}")
+                    # if DEBUG:
+                    #     print(f"Characteristic {char.uuid}: {char}")
                     # char0 should start with 0000ff01
                     if char.uuid.startswith("0000ff01"):
                         char0 = char.uuid
@@ -241,10 +246,10 @@ async def print_file(device, data_formatter_script_loc, file_path):
                 #     print("Data:", data)
 
                 # Write the data
-                await client.write_gatt_char(char1, data, response=True)
+                await client.write_gatt_char(char1, data, response=True) # type: ignore
 
                 # Check if the data was written
-                await client.read_gatt_char(char0)
+                await client.read_gatt_char(char0) # type: ignore
 
             # Remove the file
             os.remove(path_pho)
@@ -286,6 +291,7 @@ class AudioPlayer(threading.Thread):
     def run(self):
         while not self.stop_event.is_set():
             try:
+                # Try to get an audio file from the queue
                 audio_file = self.audio_queue.get(timeout=1)
                 if audio_file is None:
                     break
@@ -293,9 +299,8 @@ class AudioPlayer(threading.Thread):
                 self.play_audio(audio_file)
                 self.audio_queue.task_done()
             except queue.Empty:
-                continue
-            except Exception as e:
-                print(f"Error during audio playback: {e}")
+                # If the queue is empty, sleep briefly to avoid high CPU usage
+                time.sleep(1)
 
         print("Audio playback thread exiting...")
 
@@ -306,11 +311,11 @@ class AudioPlayer(threading.Thread):
                 # Stop the current playback if it exists
                 pygame.mixer.music.stop()
 
-                # Load the audio file using pygame
+                # Load and play the new audio file
                 pygame.mixer.music.load(audio_file)
                 pygame.mixer.music.play()
                 self.current_audio_file = audio_file
-
+                
                 # Wait for the playback to finish
                 while pygame.mixer.music.get_busy():
                     if self.stop_event.is_set():
@@ -320,7 +325,6 @@ class AudioPlayer(threading.Thread):
         except Exception as e:
             print(f"Error playing audio file {audio_file}: {e}")
 
-
 def start_audio_playback_thread():
     global audio_playback_thread, stop_audio_event, audio_queue, audio_playback_lock
     stop_audio_event.clear()
@@ -328,39 +332,37 @@ def start_audio_playback_thread():
     audio_playback_thread.start()
 
 def stop_audio_playback_thread():
-    global audio_playback_thread, stop_audio_event, audio_queue
+    global audio_playback_thread, stop_audio_event
     if audio_playback_thread:
         stop_audio_event.set()
-        audio_queue.put(None)  # Ensure the thread exits if it's waiting on the queue
+        # Ensure the thread exits if it's waiting on the queue
+        audio_queue.put(None)  
         audio_playback_thread.join()
         print("Audio playback thread stopped.")
 
-# ------------------------- Button monitoring functions ------------------------
+# --------------- Function to monitor button press from Arduino ----------------
 
 def monitor_button_press():
-    """Simulate reading serial data from Arduino"""
+    """Monitor the button press from Arduino"""
     global state, stop_button_event
     while not stop_button_event.is_set():
         try:
-            # if ARDUINO.in_waiting > 0:
-            #     line = ARDUINO.readline().decode('utf-8').rstrip()
-            #     print("Line from Arduino:", line)
-            #     if line == "1":
-            #         return True
+            if arduino.in_waiting > 0:
+                line = arduino.readline().decode('utf-8').rstrip()
+                # if DEBUG:
+                #     print("Line from Arduino:", line)
+                if line == "button pressed":
+                    with state_lock:
+                        if state == State.IDLE:
+                            if DEBUG:
+                                print("Button pressed!")
+                            state = State.INTERACTION
 
-            button_state = input("Press the button (0 or 1): ")
-            if button_state == "1" and state == State.IDLE:
-                if DEBUG:
-                    print("Button pressed!")
-                state = State.INTERACTION
-
-                # Set the stop event to stop the idle flow
-                if DEBUG:
-                    print("Send the idle stop event...")
-                stop_idle_event.set()  # Stop idle flow
-                if DEBUG:
-                    print("Send the button stop event...")
-                stop_button_event.set()  # Stop button monitoring
+                            # Set the stop event to stop the idle flow
+                            stop_idle_event.set()  # Stop idle flow
+                            stop_button_event.set()  # Stop button monitoring
+                            
+                            break
         except Exception as e:
             print(f"Error in monitor_button_press: {e}")
 
@@ -385,27 +387,10 @@ def stop_button_monitoring():
     if DEBUG:
         print("Stopping the button monitoring thread...")
     stop_button_event.set()
-    button_thread.join()
+    if button_thread:
+        button_thread.join()
 
-# ----------------------------- Helper functions -------------------------------
-
-# Helper function to handle errors
-def must(action, err):
-    """Handle errors"""
-    if err:
-        sys.exit(f"Fatal error: Failed to {action}: {err}")
-
-# Copy the file to the target folder
-def copy_file_to_folder(file, folder):
-    """Copy the file to the target folder"""
-    try:
-        if not os.path.exists(folder):
-            os.makedirs(folder)
-        shutil.copy(file, os.path.join(folder, "toprint.jpg"))
-    except Exception as e:
-        must(f"copy {file} to {folder}", e)
-
-# ------------------------- Flow control functions -----------------------------
+# --------------- Idle flow and interaction flow functions ---------------------
 
 def run_idle_flow():
     """Run the idle flow and ensure continuous playback."""
@@ -426,30 +411,32 @@ def run_idle_flow():
                     audio_queue.put(audio_file)
                     time.sleep(3)  # Adjust the interval as needed
 
-        if DEBUG:
-            print("End of idle flow.")
     except Exception as e:
-        print(f"Error in run_idle_flow: {e}")
+        if DEBUG:
+            print(f"Error in run_idle_flow: {e}")
+
 
 def start_idle_flow():
-    """Start the idle flow"""
-    global idle_thread
+    """Start the idle flow thread"""
+    global idle_thread, stop_idle_event
 
     stop_idle_event.clear()
 
     if DEBUG:
-        print("Starting idle flow...")
+        print("Starting the idle flow thread...")
     idle_thread = threading.Thread(target=run_idle_flow)
     idle_thread.daemon = True
     idle_thread.start()
 
 def stop_idle_flow():
-    """Stop the idle flow"""
-    global stop_idle_event, idle_thread
+    """Stop the idle flow thread"""
+    global stop_idle_event
+
     if DEBUG:
-        print("Stopping the idle flow...")
+        print("Stopping the idle flow thread...")
     stop_idle_event.set()
-    idle_thread.join()
+    if idle_thread:
+        idle_thread.join()
 
 async def run_interaction_flow():
     """Main flow of the program"""
@@ -465,32 +452,45 @@ async def run_interaction_flow():
 
     if response and response.status_code == 200:
         poem = parse_streamed_response(response)
+        
+        if DEBUG:
+            print("Poem generated:", poem)
+        
         # if DEBUG:
         #     print("Generating speech from response...")
-        # generate_tts(poem)
+        
+        if not SKIP_TTS_PRINTING:
+            if DEBUG:
+                print("Generating speech from response...")
+            generate_tts(poem)
 
-        # Generate a .txt file with the poem
-        with open(f"generated-poems/txt/poem-{generated_poems_count}.txt",
-                  "w", encoding="utf-8") as file:
-            file.write(poem)
+            # Generate a .txt file with the poem
+            if DEBUG:
+                print("Saving the poem as a .txt file...")
+            with open(f"generated-poems/txt/poem-{generated_poems_count}.txt",
+                    "w", encoding="utf-8") as file:
+                file.write(poem)
 
-        # Generate a 256x256 image with the text of the poem
-        generate_image_from_text(poem, FONT)
+            # Generate a 256x256 image with the text of the poem
+            if DEBUG:
+                print("Generating an image from the poem...")
+            generate_image_from_text(poem, FONT)
 
-        # Print the poem
-        print("Printing the poem...")
-        printer = await find_printer()
-
-        # The printer is sometimes not found, so we need to loop
-        # until it is found
-        while not printer:
-            print("Error: printer not found. Trying again...")
+            # Print the poem
+            if DEBUG:
+                print("Printing the poem...")
             printer = await find_printer()
 
-        if printer:
-            await print_file(
-              printer, PRINTER_DATA_FORMATTER,
-              f"generated-poems/img/poem-{generated_poems_count}.png")
+            # The printer is sometimes not found, so we need to loop
+            # until it is found
+            while not printer:
+                print("Error: printer not found. Trying again...")
+                printer = await find_printer()
+
+            if printer:
+                await print_file(
+                  printer, PRINTER_DATA_FORMATTER,
+                  f"generated-poems/img/poem-{generated_poems_count}.png")
 
     else:
         print("Failed to get a response from LLAMA3 or invalid response.",
@@ -499,21 +499,25 @@ async def run_interaction_flow():
     if DEBUG:
         print("End of interaction flow.")
 
-# ------------------------------ Main function --------------------------------
+# ---------------------------- Main Function -----------------------------------
 
 def main():
     """Main function"""
-    global button_thread, audio_playback_thread, state, stop_idle_event, stop_button_event
-
-    # Start the button press checking thread
-    start_button_monitoring()
-
-    # Start the audio playback thread
-    start_audio_playback_thread()
+    global button_thread, audio_playback_thread, state, stop_idle_event, stop_button_event, arduino, idle_thread, audio_queue, state_lock
+    
+    try:
+        arduino = serial.Serial(ARDUINO_PORT, 9600)
+    except Exception as e:
+        print(f"Failed to connect to Arduino: {e}")
+        sys.exit(1)
 
     while True:
         try:
             if state == State.IDLE:
+                # If audio playback thread is not running, start it
+                if audio_playback_thread is None or not audio_playback_thread.is_alive():
+                    start_audio_playback_thread()
+                
                 # If the button monitoring thread is not running, start it
                 if button_thread is None or not button_thread.is_alive():
                     start_button_monitoring()
@@ -530,20 +534,48 @@ def main():
                     stop_idle_flow()
 
                 if audio_playback_thread is not None and audio_playback_thread.is_alive():
-                      stop_audio_playback_thread()
+                    stop_audio_playback_thread()
 
                 asyncio.run(run_interaction_flow())
 
                 if DEBUG:
                     print("Resuming idle state...")
-                state = State.IDLE
-
-                # Restart the audio playback thread
-                start_audio_playback_thread()
+                with state_lock:
+                    state = State.IDLE
 
             time.sleep(0.1)
+            
+        # On KeyboardInterrupt, break the loop and exit
+        except KeyboardInterrupt:
+            print("Exiting...")
+            
+            if arduino.is_open:
+                arduino.close()
+            
+            if button_thread is not None and button_thread.is_alive():
+                    stop_button_monitoring()
+
+            if idle_thread is not None and idle_thread.is_alive():
+                stop_idle_flow()
+
+            if audio_playback_thread is not None and audio_playback_thread.is_alive():
+                stop_audio_playback_thread()
+                
+            if audio_queue:
+                audio_queue.put(None)
+        
+            break 
+        
         except Exception as e:
             print(f"Error in main loop: {e}")
-
+    
 if __name__ == "__main__":
     main()
+    
+    # Close the serial connection
+    if arduino.is_open:
+        arduino.close()
+    
+    # Stop the audio playback thread
+    if audio_playback_thread:
+        stop_audio_playback_thread()

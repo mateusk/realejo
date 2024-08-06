@@ -27,6 +27,7 @@ import pygame
 from TTS.api import TTS
 from bleak import BleakScanner, BleakClient
 from PIL import Image, ImageFont, ImageDraw, ImageColor
+from move_bird import move_bird
 
 # Set the device to use for TTS
 TTS_DEVICE = "cpu"
@@ -452,6 +453,10 @@ async def run_interaction_flow():
     global state
     if DEBUG:
         print("Running the interaction flow...")
+        
+    # Move bird
+    move_bird() 
+        
     topic = get_topic()
     prompt = PROMPT_PREFIX + topic + PROMPT_SUFFIX
     if DEBUG:

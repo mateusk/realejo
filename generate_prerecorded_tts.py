@@ -24,7 +24,8 @@ TEXT_ARRAY = [
   "Step closer and let a happy rhyme reveal your destiny!",
   "Embrace the future with a joyful verse! Come and see!",
   "Find out what joy the future holds with a personalized poem!",
-  "A joyful future awaits! Let a poem show you the way!"
+  "A joyful future awaits! Let a poem show you the way!",
+  "Open your heart to the whispers of fate, I will show you the way!",
 ]
 
 def generate_speech(text_array):
@@ -40,3 +41,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

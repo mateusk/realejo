@@ -24,6 +24,7 @@ import queue
 import requests
 import serial
 import pygame
+from playsound import playsound
 from TTS.api import TTS
 from bleak import BleakScanner, BleakClient
 from PIL import Image, ImageFont, ImageDraw, ImageColor
@@ -63,7 +64,7 @@ FONT = "fonts/CrimsonPro-Regular.ttf"
 
 # Set up the Arduinoserial connection variables
 arduino: serial.Serial = None # type: ignore
-ARDUINO_PORT = "/dev/tty.usbmodem14401"
+ARDUINO_PORT = "/dev/tty.usbmodem143101"
 
 # Track generated poem files
 generated_poems_count = len(
@@ -415,9 +416,9 @@ def run_idle_flow():
                     time.sleep(1)  # Adjust the interval as needed
 
                 # Change the list of audio files to the pre-recorded TTS files
-                audio_files = [f for f in os.listdir("tts/pre-recorded") if f.endswith(".wav")]
+                audio_files = [f for f in os.listdir("tts/pre-recorded/idle/") if f.endswith(".wav")]
                 if audio_files:
-                    audio_file = "tts/pre-recorded/" + random.choice(audio_files)
+                    audio_file = "tts/pre-recorded/idle/" + random.choice(audio_files)
                     audio_queue.put(audio_file)
                     time.sleep(3)  # Adjust the interval as needed
 
@@ -454,67 +455,78 @@ async def run_interaction_flow():
     if DEBUG:
         print("Running the interaction flow...")
         
-    # Move bird
-    move_bird() 
-        
+    # Generate a poem
     topic = get_topic()
     prompt = PROMPT_PREFIX + topic + PROMPT_SUFFIX
     if DEBUG:
         print("Prompt to LLAMA3:", prompt)
+    
+    # Make the HTTP request asynchronously, and wait for the response
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        future = executor.submit(get_llama3_response, prompt)
 
-    response = get_llama3_response(prompt)
+        # Play the audio and move the bird at the same time
+        await asyncio.gather(
+            asyncio.to_thread(playsound, "tts/pre-recorded/interaction/before.wav"),
+            asyncio.to_thread(move_bird)
+        )
+        
+        response = future.result()
 
-    if response and response.status_code == 200:
-        poem = parse_streamed_response(response)
-        
-        if DEBUG:
-            print("Poem generated:", poem)
-        
-        # if DEBUG:
-        #     print("Generating speech from response...")
-        
-        if not SKIP_TTS_PRINTING:
+        if response and response.status_code == 200:
+            poem = parse_streamed_response(response)
+            
             if DEBUG:
-                print("Generating speech from response...")
-            # Create a thread pool executor
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                # Submit the generate_tts_async function to the executor
-                future = executor.submit(generate_tts, poem)
-
-                # Generate a .txt file with the poem
+                print("Poem generated:", poem)
+            
+            if not SKIP_TTS_PRINTING:
                 if DEBUG:
-                    print("Saving the poem as a .txt file...")
-                with open(f"generated-poems/txt/poem-{generated_poems_count}.txt",
-                        "w", encoding="utf-8") as file:
-                    file.write(poem)
+                    print("Generating speech from response...")
+                # Create a thread pool executor
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    # Submit the generate_tts_async function to the executor
+                    future = executor.submit(generate_tts, poem)
 
-                # Generate a 256x256 image with the text of the poem
-                if DEBUG:
-                    print("Generating an image from the poem...")
-                generate_image_from_text(poem, FONT)
+                    # Generate a .txt file with the poem
+                    if DEBUG:
+                        print("Saving the poem as a .txt file...")
+                    with open(f"generated-poems/txt/poem-{generated_poems_count}.txt",
+                            "w", encoding="utf-8") as file:
+                        file.write(poem)
 
-                # Print the poem
-                if DEBUG:
-                    print("Printing the poem...")
-                printer = await find_printer()
+                    # Generate a 256x256 image with the text of the poem
+                    if DEBUG:
+                        print("Generating an image from the poem...")
+                    generate_image_from_text(poem, FONT)
 
-                # The printer is sometimes not found, so we need to loop
-                # until it is found
-                while not printer:
-                    print("Error: printer not found. Trying again...")
+                    # Print the poem
+                    if DEBUG:
+                        print("Printing the poem...")
                     printer = await find_printer()
 
-                if printer:
-                    await print_file(
-                    printer, PRINTER_DATA_FORMATTER,
-                    f"generated-poems/img/poem-{generated_poems_count}.png")
-                
-                # Wait for the TTS generation to complete
-                future.result()
+                    # The printer is sometimes not found, so we need to loop
+                    # until it is found
+                    while not printer:
+                        print("Error: printer not found. Trying again...")
+                        printer = await find_printer()
 
-    else:
-        print("Failed to get a response from LLAMA3 or invalid response.",
-              "Status code:", response.status_code if response else "N/A")
+                    if printer:
+                        await print_file(
+                        printer, PRINTER_DATA_FORMATTER,
+                        f"generated-poems/img/poem-{generated_poems_count}.png")
+                    
+                    # Wait for the TTS generation to complete
+                    future.result()
+                    
+            # Play the audio and move the bird at the same time
+            await asyncio.gather(
+                asyncio.to_thread(
+                    playsound, "tts/pre-recorded/interaction/after.wav"),
+                    asyncio.to_thread(move_bird))
+
+        else:
+            print("Failed to get a response from LLAMA3 or invalid response.",
+                "Status code:", response.status_code if response else "N/A")
 
     if DEBUG:
         print("End of interaction flow.")
@@ -563,7 +575,7 @@ def main():
                 with state_lock:
                     state = State.IDLE
 
-            time.sleep(0.1)
+            time.sleep(5)
             
         # On KeyboardInterrupt, break the loop and exit
         except KeyboardInterrupt:

@@ -21,6 +21,7 @@ import threading
 import concurrent.futures
 import asyncio
 import queue
+from regex import D
 import requests
 import serial
 import pygame
@@ -34,7 +35,7 @@ from move_bird import move_bird
 TTS_DEVICE = "cpu"
 
 # Set pre-defined topics to generate poems
-TOPICS = [
+POEM_TOPICS = [
     "a rainy day you will be at a sex shop",
     "a toaster that was broken and will suddenly start working again",
     "a nice and affordable apartment in Neukölln you will find for yourself",
@@ -69,6 +70,14 @@ TOPICS = [
     "a weird art exhibit you will be visiting later",
 ]
 
+FORTUNE_TELLER_PROMPTS = [
+    "a fortune teller plush bird that can predict the future",
+    "a fortune teller plush bird that can predict that someone will be rich",
+    "a fortune teller plush bird in an art show",
+    "a fortune teller plush bird that can predict someone will be happy",
+    "a fortune teller plush bird that can predict someone will be loved"
+]
+
 PROMPT_PREFIX = "Write a short, joyful 5 line poem about "
 PROMPT_SUFFIX = ". Do not give me any comments from your side. Just write the poem."
 
@@ -86,10 +95,6 @@ FONT = "fonts/CrimsonPro-Regular.ttf"
 # Set up the Arduinoserial connection variables
 arduino: serial.Serial = None # type: ignore
 ARDUINO_PORT = "/dev/tty.usbmodem143101"
-
-# Track generated poem files
-generated_poems_count = len(
-    [f for f in os.listdir("tts/generated-poems") if f.endswith(".wav")])
 
 stop_idle_event = threading.Event()
 stop_button_event = threading.Event()
@@ -109,13 +114,15 @@ TTS = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(TTS_DEVICE)
 
 PRINTER_DATA_FORMATTER = "m02_printer_data_formatter.py"
 
-SKIP_TTS_PRINTING = False
+SKIP_PRINTING = False
 
 # ------------- Poem generation and LLAMA3 API-related functions ---------------
 
-def get_topic():
+def get_topic(type):
     """Select a random prompt from the pre-defined list"""
-    return random.choice(TOPICS)
+    if type == "fortune teller":
+        return random.choice(FORTUNE_TELLER_PROMPTS)
+    return random.choice(POEM_TOPICS)
 
 def get_llama3_response(prompt):
     """Make a POST request to LLAMA3 API"""
@@ -154,14 +161,23 @@ def parse_streamed_response(response):
                 full_response += json_obj["response"]
     return full_response
 
+def generate_tts_poem_in_idle():
+    global tts_generation_thread
+    topic = get_topic("fortune teller")
+    prompt = PROMPT_PREFIX + topic + PROMPT_SUFFIX
+    response = get_llama3_response(prompt)
+    poem = parse_streamed_response(response)
+    generate_tts(poem)
+    
 # ----------------------- TTS generation functions -----------------------------
 
 def generate_tts(text):
-    """Generate audio from text using TTS"""
-    print("generate_tts")
-    global generated_poems_count
-    generated_poems_count += 1
-    file_path = f"tts/generated-poems/poem-{generated_poems_count}.wav"
+    """Generate audio from poem using TTS"""
+    if DEBUG:
+        print("Generating speech from text...")
+    number_idle_recordings = len(
+    [f for f in os.listdir("tts/idle/generated") if f.endswith(".wav")])
+    file_path = f"tts/idle/generated/output_{number_idle_recordings + 1}.wav"
     try:
         TTS.tts_to_file(text, speaker_wav="tts/voice-cloning/ref.wav", language="en", file_path=file_path) # type: ignore
         if DEBUG:
@@ -169,10 +185,12 @@ def generate_tts(text):
     except Exception as e:
         print(f"Error generating speech: {e}")
         
-def generate_tts_thread(text):
+def generate_tts_thread():
     """Generate audio from text using TTS in a separate thread"""
+    if DEBUG:
+        print("Starting TTS generation thread...")
     global tts_generation_thread
-    tts_generation_thread = threading.Thread(target=generate_tts, args=(text,))
+    tts_generation_thread = threading.Thread(target=generate_tts_poem_in_idle)
     tts_generation_thread.start()
 
 # ----------------------- Printing-related functions ---------------------------
@@ -203,11 +221,15 @@ def generate_image_from_text(
 
     # Draw the text on the image
     draw.multiline_text(text_position, wrapped_text, font=font, fill=ImageColor.getrgb("black"))
+    
+    generated_poems_count = len(
+        [f for f in os.listdir("generated-poems/txt") if f.endswith(".txt")])
 
     # Save the image
     image.save(f"generated-poems/img/poem-{generated_poems_count}.png")
 
-    print(f"Text image saved with font size: {font_size}")
+    if DEBUG:
+        print(f"Text image saved")
 
 # Method to find the bluetooth printer device
 async def find_printer():
@@ -328,6 +350,10 @@ class AudioPlayer(threading.Thread):
                 if audio_file is None:
                     break
 
+                # If audio src is /idle/generated or /idle/pre-recorded,
+                # move the bird while playing the audio
+                if "idle/generated" in audio_file or "idle/pre-recorded" in audio_file:
+                    move_bird()
                 self.play_audio(audio_file)
                 self.audio_queue.task_done()
             except queue.Empty:
@@ -429,17 +455,31 @@ def run_idle_flow():
     try:
         while not stop_idle_event.is_set():
             if state == State.IDLE:
+                # Draw a random number, if number is smaller than 0.1...
+                if random.random() < 0.01:
+                    # Then, generate a new poem using the FORTUNE_TELLER_PROMPTS
+                    # Make the HTTP request asynchronously, and wait for the response
+                    generate_tts_thread()
+                    
+                    
+                
                 # Create a list of .wav files from the audio folder
                 audio_files = [f for f in os.listdir("audio/realejo") if f.endswith(".wav")]
                 if audio_files:
                     audio_file = "audio/realejo/" + random.choice(audio_files)
                     audio_queue.put(audio_file)
-                    time.sleep(1)  # Adjust the interval as needed
+                    time.sleep(1) 
+                    
+                audio_src_folder = "tts/idle/pre-recorded/"
+                generated_count = len(
+                    [f for f in os.listdir("tts/idle/generated") if f.endswith(".wav")])
+                if random.random() < 0.5 and generated_count > 0:
+                    audio_src_folder = "tts/idle/generated/"
 
                 # Change the list of audio files to the pre-recorded TTS files
-                audio_files = [f for f in os.listdir("tts/pre-recorded/idle/") if f.endswith(".wav")]
+                audio_files = [f for f in os.listdir(audio_src_folder) if f.endswith(".wav")]
                 if audio_files:
-                    audio_file = "tts/pre-recorded/idle/" + random.choice(audio_files)
+                    audio_file = audio_src_folder + random.choice(audio_files)
                     audio_queue.put(audio_file)
                     time.sleep(3)  # Adjust the interval as needed
 
@@ -477,7 +517,7 @@ async def run_interaction_flow():
         print("Running the interaction flow...")
         
     # Generate a poem
-    topic = get_topic()
+    topic = get_topic("poem")
     prompt = PROMPT_PREFIX + topic + PROMPT_SUFFIX
     if DEBUG:
         print("Prompt to LLAMA3:", prompt)
@@ -488,9 +528,12 @@ async def run_interaction_flow():
 
         # Play the audio and move the bird at the same time
         await asyncio.gather(
-            asyncio.to_thread(playsound, "tts/pre-recorded/interaction/before.wav"),
+            asyncio.to_thread(playsound, "tts/interaction/before.wav"),
             asyncio.to_thread(move_bird)
         )
+        
+        interlude_player = pygame.mixer.Sound("audio/interaction/interlude.wav")
+        interlude_player.play()
         
         response = future.result()
 
@@ -500,49 +543,48 @@ async def run_interaction_flow():
             if DEBUG:
                 print("Poem generated:", poem)
             
-            if not SKIP_TTS_PRINTING:
+            if not SKIP_PRINTING:
                 if DEBUG:
                     print("Generating speech from response...")
-                # Create a thread pool executor
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    # Submit the generate_tts_async function to the executor
-                    future = executor.submit(generate_tts, poem)
+    
+                # Generate a .txt file with the poem
+                if DEBUG:
+                    print("Saving the poem as a .txt file...")
+                # Track generated poem files
+                generated_poems_count = len(
+                    [f for f in os.listdir("generated-poems/txt") if f.endswith(".txt")]) + 1
+                with open(f"generated-poems/txt/poem-{generated_poems_count}.txt",
+                        "w", encoding="utf-8") as file:
+                    file.write(poem)
 
-                    # Generate a .txt file with the poem
-                    if DEBUG:
-                        print("Saving the poem as a .txt file...")
-                    with open(f"generated-poems/txt/poem-{generated_poems_count}.txt",
-                            "w", encoding="utf-8") as file:
-                        file.write(poem)
+                # Generate a 256x256 image with the text of the poem
+                if DEBUG:
+                    print("Generating an image from the poem...")
+                generate_image_from_text(poem, FONT)
 
-                    # Generate a 256x256 image with the text of the poem
-                    if DEBUG:
-                        print("Generating an image from the poem...")
-                    generate_image_from_text(poem, FONT)
+                # Print the poem
+                if DEBUG:
+                    print("Printing the poem...")
+                printer = await find_printer()
 
-                    # Print the poem
-                    if DEBUG:
-                        print("Printing the poem...")
+                # The printer is sometimes not found, so we need to loop
+                # until it is found
+                while not printer:
+                    print("Error: printer not found. Trying again...")
                     printer = await find_printer()
 
-                    # The printer is sometimes not found, so we need to loop
-                    # until it is found
-                    while not printer:
-                        print("Error: printer not found. Trying again...")
-                        printer = await find_printer()
-
-                    if printer:
-                        await print_file(
-                        printer, PRINTER_DATA_FORMATTER,
-                        f"generated-poems/img/poem-{generated_poems_count}.png")
+                if printer:
+                    await print_file(
+                    printer, PRINTER_DATA_FORMATTER,
+                    f"generated-poems/img/poem-{generated_poems_count}.png")
                     
-                    # Wait for the TTS generation to complete
-                    future.result()
+            # Stop the interlude audio
+            interlude_player.stop()
                     
             # Play the audio and move the bird at the same time
             await asyncio.gather(
                 asyncio.to_thread(
-                    playsound, "tts/pre-recorded/interaction/after.wav"),
+                    playsound, "tts/interaction/after.wav"),
                     asyncio.to_thread(move_bird))
 
         else:

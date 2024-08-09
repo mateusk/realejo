@@ -455,9 +455,13 @@ def run_idle_flow():
     try:
         while not stop_idle_event.is_set():
             if state == State.IDLE:
-                # Draw a random number, if number is smaller than 0.1...
-                if random.random() < 0.01:
-                    # Then, generate a new poem using the FORTUNE_TELLER_PROMPTS
+                # Generate a new poem using the FORTUNE_TELLER_PROMPTS
+                # These poems are generated in the background
+                # and played eventually during the idle flow
+                # We want the poem generation to be only triggered
+                # once in a while, so we use a random number to aprox.
+                # 1/200 chance of generating a new poem
+                if random.random() < 1/200:
                     # Make the HTTP request asynchronously, and wait for the response
                     generate_tts_thread()
                     
